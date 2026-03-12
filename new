@@ -1,0 +1,194 @@
+concentrations = []
+ion_names = []
+charges = []
+
+    # Всегда добавляем основные ионы
+concentrations.extend([C_H, C_SO4, C_HSO4, C_Fe3, C_Fe2, C_K, C_NH4, C_Mg2, C_MgSO4, C_OH])
+ion_names.extend(['H', 'SO4', 'HSO4','Fe3', 'Fe2', 'K', 'NH4', 'Mg2','MgSO4', 'OH'])
+charges.extend([1, -2,-1, 3, 2, 1, 1, 2, 0, 1])
+    
+    # Добавляем катион для K и NH4 ярозитов
+    if jarosite_type in ['K', 'NH4']:
+        if jarosite_type == 'K':
+            C_cation = C_K
+            cation_name = 'K'
+        else:
+            C_cation = C_NH4
+            cation_name = 'NH4'
+        concentrations.append(C_cation)
+        ion_names.append(cation_name)
+        charges.append(1)
+    
+    # Стандартная ΔG° для образования ярозита
+    dG0_T = dH0 - T * dS0
+     
+    result_act = iterative_speciation_calculation(
+    T=T,
+    ion_names=ion_names,
+    concentrations=concentrations,
+    charges=charges,
+    max_iter=15,
+    tol=1e-4,
+    add_Mg=add_MgOH
+    )
+
+    # Используем активности для Q_full
+    a_H = result_act['activities'].get('H')
+    a_SO4 = result_act['activities'].get('SO4')
+    a_HSO4 = result_act['activities'].get('HSO4')
+    a_Fe3 = result_act['activities'].get('Fe3')
+    a_Mg2 = result_act['activities'].get('Mg2') if add_MgOH==True else 0
+    a_OH = result_act['activities'].get('OH') if add_MgOH==True else 0
+    K_MgSO4 = result_act['dissociation'].get('K_MgSO4') if add_MgOH==True else 0
+    K_HSO4 = result_act['dissociation'].get('K_HSO4')
+    
+    # выводим остальные расчетные параметры для проверки 
+    A = result_act.get('A', {})
+    B = result_act.get('B', {})
+    density = result_act.get('density')
+    epsilon = result_act.get('epsilon')
+    si_terms = result_act.get('si_terms')
+    dh_terms = result_act.get('dh_terms')
+    I = result_act.get('ionic_strength')
+
+    Q_simple = 0
+    Q_full = 0
+    
+    if jarosite_type in ['K', 'NH4']:
+       
+        cation_key = 'K' if jarosite_type == 'K' else 'NH4'
+        a_cation = result_act['activities'].get(cation_key)
+
+        if C_Fe3 < 1e-5 or C_cation < 1e-5 or C_SO4 < 1e-5:
+            Q_simple = 0
+        if a_Fe3 is None or a_Fe3 < 1e-7 or a_cation is None or a_cation < 1e-7 or a_SO4 is None or a_SO4 < 1e-7:
+            Q_full = 0
+        else:
+            Q_simple = (C_H**2) / (C_cation**(1/3) * (C_Fe3) * (C_SO4**(2/3)))
+            Q_full = (a_H**2) / (a_cation**(1/3) * (a_Fe3) * (a_SO4**(2/3)))
+            
+    elif jarosite_type == 'H3O':
+        if C_Fe3 < 1e-5 or C_SO4 < 1e-5:
+            Q_simple = 0
+        if a_Fe3 is None or a_Fe3 < 1e-7 or a_SO4 is None or a_SO4 < 1e-7:
+            Q_full = 0
+        else:
+            Q_simple = (C_H**(5/3)) / ((C_Fe3) * (C_SO4**(2/3)))
+            Q_full = (a_H**(5/3)) / ((a_Fe3) * (a_SO4**(2/3)))
+    
+    dG_simple = 0 
+    dG_full = 0
+    
+    if Q_simple <= 1e-10 or np.isnan(Q_simple):
+        dG_simple = 1e4
+    if Q_full <= 1e-10 or np.isnan(Q_full):
+        dG_full =1e4
+    else:
+        dG_simple = dG0_T + constants.R * T * np.log(Q_simple)
+        dG_full = dG0_T + constants.R * T * np.log(Q_full)
+
+    # pH раствора
+    pH = -np.log10(a_H) if (a_H is not None and a_H > 0) else 7
+    
+    # Критерий образования ярозита:
+    jarosite_forms = dG_full < 0
+    jarosite_forms_simple = dG_simple < 0
+    
+    # ПРОВЕРКA:
+    if C_Fe3 < 0 or C_H < 0 or C_SO4 < 0:
+        print(f"ОШИБКА: отрицательная концентрация!")
+        print(f"  C_Fe3 = {C_Fe3}, C_H1 = {C_H}, C_SO4 = {C_SO4}")
+        print(f"  n_Fe3 = {n_Fe3}, n_H1 = {n_H}, n_SO4 = {n_SO4}")
+        print(f"  T = {T}, S_Ox = {S_Ox}, jarosite_type = {jarosite_type}")
+        print(f"  add_H2SO4 = {add_H2SO4}, add_MgOH = {add_MgOH}")
+    
+    report = {
+        # Основные параметры системы
+        'T_K': T,
+        'T_C': T - 273.15,
+        'S_Ox': S_Ox,
+        'jarosite_type': jarosite_type,
+        'add_H2SO4': add_H2SO4,
+        'add_MgOH': add_MgOH,
+        
+        # Энергетические параметры
+        'dG0_T_kJ_mol': dG0_T / 1000,
+        'dG_simple': dG_simple / 1000,
+        'dG_full': dG_full / 1000,
+        'Q_simple': Q_simple,
+        'Q_full': Q_full,
+        'jarosite_forms': jarosite_forms,
+        'jarosite_forms_simple': jarosite_forms_simple,
+        'jarosite_status': '✅ Образуется' if jarosite_forms else '❌ НЕ образуется',
+        
+        # Количества веществ (моль)
+        'n_FeS2': n_FeS2,
+        'n_FeAsS': n_FeAsS,
+        'n_Fe2_pyr': n_Fe2_pyr,
+        'n_Fe2_ars': n_Fe2_ars,
+        'n_SO4_pyr': n_SO4_pyr,
+        'n_SO4_ars': n_SO4_ars,
+        'n_H_pyr': n_H_pyr,
+        'n_H_ars': n_H_ars,
+        'n_Fe2_tot': n_Fe2_tot,
+        'n_Fe3_tot': n_Fe3_tot,
+        'n_Fe2_left': n_Fe2_left,
+        'n_Fe3_left': n_Fe3,
+        'n_Fe3_FeAsO4': n_Fe3_FeAsO4,
+        'n_AsO4_ars': n_AsO4_ars,
+        'n_As_left': n_As_left,
+        'n_H_free_initial': n_H_free,
+        'n_H_consumed_Fe_ox': n_H_consumed_Fe_ox,
+        
+        # Добавки реагентов
+        'n_H2SO4_added': n_H2SO4_added if add_H2SO4==True else 0,
+        'n_H_added': n_H_added,
+        'n_SO4_added': n_SO4_added,
+        'n_MgOH_added': n_MgOH_added if add_MgOH==True else 0,
+        'n_OH_added': n_OH_added,
+        'n_H_MgSO4': n_H_MgSO4,
+        'n_SO4_MgSO4_tot': n_SO4_MgSO4_tot,
+        'n_MgSO4_aq': n_MgSO4_aq,
+        'n_H_MgSO4_free': n_H_MgSO4_free,
+        'n_MgSO4_prec': n_MgSO4_prec,
+        
+        # Финальные количества
+        'n_Fe2': n_Fe2,
+        'n_Fe3': n_Fe3,
+        'n_H_': n_H,
+        'n_SO4': n_SO4,
+        'n_Mg2': n_Mg2,
+        
+        # Концентрации (моль/кг)
+        'C_Fe2': C_Fe2,
+        'C_Fe3': C_Fe3,
+        'C_H': C_H,
+        'C_SO4': C_SO4,
+        'C_Mg2': C_Mg2,
+        f'C_{jarosite_type}': C_cation,
+        
+        # Ионная сила и другие параметры
+        'A': A,
+        'B': B,
+        'I': I,
+        'density': density,
+        'si_terms': si_terms,
+        'dh_terms': dh_terms,
+        'epsilon': epsilon,
+        # Активности
+        'a_H': a_H,
+        'a_OH': a_OH,
+        'pH': pH,
+        'a_Fe3': a_Fe3,
+        'a_SO4': a_SO4,
+        'a_HSO4': a_HSO4,
+        'a_Mg2': a_Mg2,
+        'a_cation': a_cation if jarosite_type in ['K', 'NH4'] else 0,
+        'K_MgSO4': K_MgSO4,
+        'K_HSO4': K_HSO4
+         
+    }
+    
+    
+    return report
+    
