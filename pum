@@ -1,0 +1,480 @@
+ 
+from scipy import constants
+import numpy as np
+import copy
+from sympy import inverse_cosine_transform
+from main_file import (
+    SolutionState
+)
+from scipy.optimize import least_squares, fsolve
+import warnings
+# расчет активностей ионов 
+
+class ActivityCalculator:
+    # константы в сгс
+    k_CGS = 1.38054e-16
+    e_CGS = 4.80320425e-10
+
+    # берем значения для воды из интерполяционных функций
+    def __init__(self, density, epsilon):
+        self.get_density = density
+        self.get_epsilon = epsilon
+    
+    # Возвращаем радиус иона из словаря параметров
+    def get_ion_radius(self, ions):
+        return ions.get("r", 0)
+    
+    # расчет параметра А для заданной температуры и параметров воды, (кг^1/2 * моль ^ 1/2)
+    def calculate_A(self, T, density, epsilon):
+        numerator = (2 * np.pi * constants.N_A)**0.5 * (self.e_CGS**3) * (density**0.5)
+        denominator = 2.302585 * 1000**0.5 * (epsilon * self.k_CGS * T)**1.5
+        return numerator / denominator
+    
+    # расчет параметра В для заданной температуры и параметров воды, (кг^1/2 * моль ^ 1/2 / см)
+    def calculate_B(self, T, density, epsilon):
+        numerator = 8 * np.pi * constants.N_A * density * self.e_CGS**2
+        denominator = epsilon * self.k_CGS * T * 1000
+        return (numerator / denominator)**0.5
+
+    # расчет ионной силы раствора для всех ионов в растворе
+    def calculate_ionic_strength(self, ions):
+        I = 0
+        for ion_name, params in ions.items():
+            I += params["C"] * params["z"]**2
+        return 0.5 *I
+    
+    # уравнение Дебая-Хюккеля
+    def debye_huckel_term(self, z, I, A, B, a):
+        denominator = 1 + a * B * np.sqrt(I)
+        return -A * z**2 * np.sqrt(I) / denominator
+    
+    
+    # объединяем все функции и выполняем расчет логарифма коэффициента активности для данной температуры и набора ионов
+    def calculate(self, T, ions):
+        
+        density = self.get_density(T)
+        epsilon = self.get_epsilon(T)
+
+        A = self.calculate_A(T, density, epsilon)
+        B = self.calculate_B(T, density, epsilon)
+        I = self.calculate_ionic_strength(ions)
+
+        for ion_name, params in ions.items():
+            z = params["z"] # заряд иона из словаря
+            a = self.get_ion_radius(params) # ионный радиус из словаря
+            dh_term = self.debye_huckel_term(z, I, A, B, a)
+            si_term = -0.4 * ions["SO4"]["C"]
+
+            log_gamma = dh_term + si_term
+            gamma = 10**log_gamma
+            assert gamma > 0
+            # обновляем словарь ионов
+            params["gamma"] = gamma
+            params["a"] = params["C"] * gamma  # активность * концентрация
+
+        # возвращаем обновленный словарь
+        return ions, I
+
+
+class SpeciationSolver:
+    def __init__(self, ions, activity_model, h2so4_interp=None, mgso4_interp=None, add_Mg=False, max_iter=50, tol=1e-8):
+        # Убираем T из __init__
+        self.activity_model = activity_model
+        self.ions = ions
+        self.h2so4_interp = h2so4_interp
+        self.mgso4_interp = mgso4_interp
+        self.add_Mg = add_Mg
+        self.max_iter = max_iter
+        self.tol = tol
+
+        # Создаем структуру для хранения состояния
+        self.state = type('State', (), {})()
+        self.state.concentrations = {ion: data['C'] for ion, data in ions.items()}
+        self.state.gamma = {ion: 1.0 for ion in ions}
+        self.state.I = 0.0
+        self.state.K_HSO4 = None  # для хранения последней константы HSO4
+        self.state.K_MgSO4 = None  # для хранения последней константы MgSO4
+
+        # история
+        self.I_history = []
+        self.gamma_history = []
+
+        # сохраняем исходные суммы для масс-баланса
+        self.total_H = ions['H']['C']
+        self.total_SO4 = ions['SO4']['C']
+        self.total_Mg = ions.get('Mg', {}).get('C', 0)
+
+    def calculate(self, T, ions=None):
+        """Расчет для температуры T"""
+        current_ions = ions if ions is not None else self.ions
+        
+        for iteration in range(self.max_iter):
+            # Сохраняем историю
+            self.I_history.append(self.state.I)
+            self.gamma_history.append(self.state.gamma.copy())
+            
+            # 1. Рассчитываем активности с текущими концентрациями
+            ions_updated, I = self.activity_model.calculate(T, current_ions)
+            
+            # 2. Обновляем коэффициенты активности и ионную силу
+            self.state.I = I
+            for ion_name in ions_updated:
+                if ion_name in current_ions:
+                    current_ions[ion_name].update(ions_updated[ion_name])
+                    self.state.gamma[ion_name] = ions_updated[ion_name].get('gamma', 1.0)
+            
+            # 3. Решаем систему равновесий
+            if not self.add_Mg:
+                new_conc = self._solve_system_no_mg(T)
+            else:
+                new_conc = self._solve_system_only_mg(T)  # ✅ исправлено
+            
+            # 4. Проверяем сходимость
+            deltas = []
+            for ion, new_val in new_conc.items():
+                old_val = self.state.concentrations.get(ion, 0)
+                deltas.append(abs(old_val - new_val))
+                self.state.concentrations[ion] = new_val
+            
+            # 5. Обновляем концентрации в ions
+            for ion, new_val in new_conc.items():
+                if ion in current_ions:
+                    current_ions[ion]['C'] = new_val
+            
+            # Проверяем сходимость
+            if deltas and max(deltas) < self.tol:
+                break
+        
+        return self.state
+    
+    def _solve_system_no_mg(self, T):
+        """Решение системы без магния"""
+        H = self.state.concentrations.get("H", 1e-15)
+        SO4 = self.state.concentrations.get("SO4", 1e-15)
+        HSO4 = self.state.concentrations.get("HSO4", 0)
+        
+        γH = self.state.gamma.get("H", 1.0)
+        γSO4 = self.state.gamma.get("SO4", 1.0)
+        γHSO4 = self.state.gamma.get("HSO4", 1.0)
+        
+        K_HSO4 = self.h2so4_interp.get_K(T, self.state.I) if self.h2so4_interp else 1e-2
+        
+        def eq(vars):
+            SO4_val, H_val, HSO4_val = vars
+            return [
+                SO4_val + HSO4_val - self.total_SO4,
+                H_val + HSO4_val - self.total_H,
+                (SO4_val * γSO4) * (H_val * γH) - K_HSO4 * HSO4_val * γHSO4
+            ]
+        
+        x0 = [max(SO4, 1e-15), max(H, 1e-15), max(HSO4, 1e-15)]
+        
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=RuntimeWarning)
+            try:
+                res = fsolve(eq, x0, full_output=True)
+                solution, info, ier, mesg = res
+                if ier != 1:
+                    solution = x0
+            except:
+                solution = x0
+        
+        SO4_new, H_new, HSO4_new = solution
+        
+        return {
+            "SO4": max(SO4_new, 1e-15),
+            "H": max(H_new, 1e-15),
+            "HSO4": max(HSO4_new, 0)
+        }
+    
+    def _solve_system_only_mg(self, T):
+        """Решение системы с магнием"""
+        H = self.state.concentrations.get("H", 1e-15)
+        SO4 = self.state.concentrations.get("SO4", 1e-15)
+        Mg = self.state.concentrations.get("Mg", 1e-15)
+        MgSO4 = self.state.concentrations.get("MgSO4", 0)
+        HSO4 = self.state.concentrations.get("HSO4", 0)
+        
+        γSO4 = self.state.gamma.get("SO4", 1.0)
+        γMg = self.state.gamma.get("Mg", 1.0)
+        γH = self.state.gamma.get("H", 1.0)
+        γHSO4 = self.state.gamma.get("HSO4", 1.0)
+        
+        K_MgSO4 = self.mgso4_interp.get_K(T) if self.mgso4_interp else 1e-3
+        K_HSO4 = self.h2so4_interp.get_K(T, self.state.I) if self.h2so4_interp else 1e-2
+        
+        def eq(vars):
+            SO4_val, H_val, HSO4_val, Mg_val, MgSO4_val = vars
+            return [
+                (SO4_val * γSO4) * (H_val * γH) - K_HSO4 * HSO4_val * γHSO4,
+                H_val + HSO4_val - self.total_H,
+                SO4_val + MgSO4_val + HSO4_val - self.total_SO4,
+                Mg_val + MgSO4_val - self.total_Mg,
+                (Mg_val * γMg) * (SO4_val * γSO4) - K_MgSO4 * MgSO4_val
+            ]
+        
+        x0 = [
+            max(SO4, 1e-15),
+            max(H, 1e-15),
+            max(HSO4, 1e-15),
+            max(Mg, 1e-15),
+            max(MgSO4, 0)
+        ]
+        
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=RuntimeWarning)
+            try:
+                res = fsolve(eq, x0, full_output=True)
+                solution, info, ier, mesg = res
+                if ier != 1:
+                    solution = x0
+            except:
+                solution = x0
+        
+        SO4_new, H_new, HSO4_new, Mg_new, MgSO4_new = solution
+        
+        return {
+            "SO4": max(SO4_new, 1e-15),
+            "H": max(H_new, 1e-15),
+            "HSO4": max(HSO4_new, 0),
+            "Mg": max(Mg_new, 1e-15),
+            "MgSO4": max(MgSO4_new, 0)
+        }
+     
+    def get_equilibrium_constants(self):
+        """Возвращает последние значения констант равновесия"""
+        return {
+            'K_HSO4': self.state.K_HSO4,
+            'K_MgSO4': self.state.K_MgSO4,
+            'I': self.state.I
+        }
+
+# Функция расчета для конкретных T и S_Ox с возможностью добавки H2SO4 или брусита для разных ярозитов
+from xml.sax.handler import all_features
+
+
+def calculate_for_T_and_S_Ox(T, S_Ox, comp = CompositionCalculator, add_H2SO4=False, add_MgOH=False, jarosite_type='ion_name'):
+    
+    jar_params = jarosite_params[jarosite_type]
+    dH0 = jar_params['dH0']
+    dS0 = jar_params['dS0']
+
+    # Энергия Гиббса образования от температуры
+    dG0_T = dH0 - T * dS0
+
+    # 1. ОСНОВНЫЕ РЕАКЦИИ ОКИСЛЕНИЯ МИНЕРАЛОВ
+    # 1.1. Окисление пирита (зависит от степени окисления серы)
+    n_Fe2_pyr = comp.n_FeS2 * S_Ox
+    n_SO4_pyr = 2 * comp.n_FeS2 * S_Ox
+    n_H_pyr = 2 * comp.n_FeS2 * S_Ox
+
+    # 1.2. Окисление арсенопирита
+    n_Fe2_ars = comp.n_FeAsS
+    n_SO4_ars = comp.n_FeAsS
+    n_H_ars = 3 * comp.n_FeAsS
+    n_AsO4_ars = comp.n_FeAsS
+    
+    #количество ионов серной кислоты после окисления
+    n_SO4_free = n_SO4_pyr + n_SO4_ars + comp.n_S_excess
+    n_H_free = n_H_pyr + n_H_ars
+    
+    #концентрация кислоты после окисления (считаем по сульфат-ионам)
+    C_SO4_free = n_SO4_free / comp.mass_liquid
+    
+    # 1.3 ОКИСЛЕНИЕ Fe²⁺ до Fe³⁺
+    # все железо в руде
+    n_Fe2_tot = n_Fe2_ars + n_Fe2_pyr +  comp.n_Fe_excess
+    
+    # все железо, способное окислиться 
+    n_Fe2_Ox = n_Fe2_tot * Fe_Ox
+    
+    # если водород в избытке, количество окисленного железа равно всему, которое способно к окислению
+    if  n_H_free >  n_Fe2_Ox:
+        n_H_consumed_Fe_ox = n_Fe2_Ox
+        n_Fe3_tot = n_Fe2_Ox
+        n_Fe2_left = n_Fe2_tot - n_Fe2_Ox #неокисленное железо
+    
+    # если железо в избытке, количество окисленного железа равно количеству водорода    
+    else:
+        n_H_consumed_Fe_ox = n_H_free
+        n_Fe3_tot = n_H_free
+        n_Fe2_left = n_Fe2_tot - n_Fe3_tot #неокисленное железо
+    
+    # 1.4 Окисленное железо осаждается в скородит
+    if n_AsO4_ars > n_Fe3_tot:
+        n_Fe3_FeAsO4 = 1 * n_Fe3_tot
+        n_As_left = n_AsO4_ars - n_Fe3_FeAsO4
+    else:
+        n_Fe3_FeAsO4 = n_AsO4_ars
+        n_As_left = 0
+    
+    n_H_free = n_H_free - n_H_consumed_Fe_ox
+    n_H2SO4_add = 0
+    n_SO4_added = 0
+    
+    # 2. ДОБАВКА H2SO4
+    if add_H2SO4==True:
+        n_H2SO4_add = (comp.m_H2SO4_add * 1000) / molar_masses['H2SO4']  
+        n_H_added = 2 * n_H2SO4_add
+        n_SO4_added = n_H2SO4_add
+  
+
+    # 3. ДОБАВКА Mg(OH)2 
+    # Определяем переменные: 
+    n_MgSO4_aq = 0 # количество растворившегося
+    n_MgSO4_tot = 0 # количество образовавшегося сульфата магния
+    n_MgSO4_prec = 0 # количество осажденного сульфата магния
+    
+    if add_MgOH==True:
+        # Переводим массу Mg(OH)2 в моли
+        n_MgOH_added = comp.m_MgOH_add / molar_masses['Mg(OH)2']  
+        n_OH_added = 2 * n_MgOH_added
+        
+        # Брусит нейтрализует кислоту: Mg(OH)2 + 2H⁺ → Mg²⁺ + 2H2O
+        # Количество водорода, потребляемого после добавления брусита
+        if n_H_free > n_OH_added:
+            n_H_MgSO4 = n_OH_added
+            n_MgSO4_tot = n_OH_added / 2
+        else:
+            n_H_MgSO4 = n_H_free
+            n_MgSO4_tot = n_H_free / 2
+        
+        n_H_MgSO4_free = n_H_free - n_H_MgSO4 # Осталось ионов водорода после нейтрализации
+        n_MgOH_left = n_MgOH_added - n_MgSO4_tot # Осталось брусита, когда вся кислота потрачена
+        n_OH = 2 * n_MgOH_left
+        #учитываем растворимость, находим количество растворенного сульфата магния
+        if n_MgSO4_tot < mgso4_sol_interp.get_sol(T, C_SO4_free)*comp.mass_liquid:
+            n_MgSO4_aq = n_MgSO4_tot
+        else:
+            n_MgSO4_aq = mgso4_sol_interp.get_sol(T, C_SO4_free)*comp.mass_liquid
+        
+        #выводим количество MgSO4 в осадке
+        n_MgSO4_prec = n_MgSO4_tot - n_MgSO4_aq
+    
+    # 4. ОБЩИЕ БАЛАНСЫ 
+    n_Fe2 = n_Fe2_left
+    n_SO4 = n_SO4_free - n_MgSO4_prec + n_SO4_added
+    n_H = n_H_free - (n_H_MgSO4 if add_MgOH==True else 0) + (n_H_added if add_H2SO4==True else 0)
+    n_Fe3 = n_Fe3_tot - n_Fe3_FeAsO4
+    n_Mg2 = (n_MgSO4_aq if add_MgOH==True else 0)
+
+
+    # Концентрации
+    #Записываем концентрации ионов для упрощенного расчета
+  
+    C_H = n_H / comp.mass_liquid
+    C_SO4 = n_SO4 / comp.mass_liquid
+    C_Fe3 = n_Fe3 / comp.mass_liquid
+    C_Fe2 = n_Fe2 / comp.mass_liquid
+    C_K = comp.m_K * S_Ox / comp.mass_liquid / molar_masses['K']
+    C_NH4 = comp.m_NH4 * S_Ox / comp.mass_liquid / molar_masses['NH4']
+    C_Mg = n_Mg2 / comp.mass_liquid
+    
+    # Делаем копию данных и используем их как расчетный образец
+    raw_params = SolutionState.ion_params(comp)
+    
+    ions_temp = {}
+    for name, data in raw_params.items():
+        ions_temp[name] = data.copy()
+    
+    ions_temp['H']['C'] = max(C_H, 1e-15)  
+    ions_temp['SO4']['C'] = max(C_SO4, 1e-15)
+    ions_temp['Fe3']['C'] = max(C_Fe3, 1e-15)
+    ions_temp['Fe2']['C'] = max(C_Fe2, 1e-15)
+    ions_temp['K']['C'] = max(C_K, 0)
+    ions_temp['NH4']['C'] = max(C_NH4, 0)
+    ions_temp['Mg']['C'] = max(C_Mg, 0)
+    
+    # 5. Расчёт активностей
+    
+    calculate_for_T_and_S_Ox._activity_calculator = ActivityCalculator(
+        water_props.get_density, 
+        water_props.get_dielectric
+    )
+        
+    activity_model = calculate_for_T_and_S_Ox._activity_calculator
+        
+    # 6. Создаем решатель для итерационного уточнения
+    calculate_for_T_and_S_Ox._solver_cache = {}
+        
+    # Создаем ключ для кэша на основе параметров, влияющих на решатель
+    solver_key = (T, add_MgOH)
+        
+    if solver_key not in calculate_for_T_and_S_Ox._solver_cache:
+        calculate_for_T_and_S_Ox._solver_cache[solver_key] = SpeciationSolver(
+            ions=ions_temp,
+            activity_model=activity_model,
+            h2so4_interp=h2so4_interp,
+            mgso4_interp=mgso4_K_interp,
+            add_Mg=add_MgOH,  
+            max_iter=15,      
+            tol=1e-4          
+            )
+    solver = calculate_for_T_and_S_Ox._solver_cache[solver_key]
+    solver.ions = ions_temp
+    solver.calculate(T, ions_temp)
+
+    eq_constants = solver.get_equilibrium_constants()
+
+    a_H = max(ions_temp['H']['a'], 1e-15)
+    a_Fe = max(ions_temp['Fe3']['a'], 1e-15)
+    a_SO4 = max(ions_temp['SO4']['a'], 1e-15)
+    pH = -np.log10(a_H) if a_H > 1e-15 else 7
+
+    
+    # получаем имя иона
+    cation = jarosite_params_dict[jarosite_type]['ion_name']
+    if cation == 'H3O': 
+        Q_no_iter = (C_H**(5/3)) / C_Fe3 * C_SO4**(2/3)
+        dG_no_iter = dG0_T + constants.R * T * np.log(Q_no_iter) if Q_no_iter > 1e-10 else 1e4
+        
+        Q_simple = (max(ions_temp['H']['C'],1e-15))**(5/3) / max(ions_temp['Fe3']['C'], 1e-15) * (max(ions_temp['SO4']['C'], 1e-15))**(2/3)
+        dG_simple = dG0_T + constants.R * T * np.log(Q_simple) if Q_simple > 1e-10 else 1e4
+
+        Q_full = a_H**(5/3) / (a_Fe * a_SO4**(2/3))
+        dG_full = dG0_T + constants.R * T * np.log(Q_full) if Q_full > 1e-10 else 1e4
+    else: 
+        Q_no_iter = max((C_H**2), 1e-15) / max(C_Fe3, 1e-15) * max(C_SO4,1e-15)**(2/3)*(max(ions_temp[cation]['C'], 1e-15)**(1/3))
+        dG_no_iter = dG0_T + constants.R * T * np.log(Q_no_iter) if Q_no_iter > 1e-10 else 1e4
+
+        Q_simple = (max(ions_temp['H']['C'],1e-15))**2 / max(ions_temp['Fe3']['C'], 1e-15) * (max(ions_temp['SO4']['C'], 1e-15))**(2/3)*(ions_temp[cation]['C']**(1/3))
+        dG_simple = dG0_T + constants.R * T * np.log(Q_simple) if Q_simple > 1e-10 else 1e4
+    
+        Q_full = a_H**2 / (a_Fe * a_SO4**(2/3) * max(ions_temp[cation]['a'], 1e-15)**(1/3))
+        dG_full = dG0_T + constants.R * T * np.log(Q_full) if Q_full > 1e-10 else 1e4    
+    
+    report = {
+        'pH': pH,
+        'Q_simple': Q_simple,
+        'Q_full': Q_full,
+        'Q_no_iter': Q_no_iter,
+        'dG_full': dG_full / 1000, # кДж
+        'dG_simple': dG_simple /1000, # кДж
+        'dG_no_iter': dG_no_iter /1000, # кДж
+
+        # Концентрации (моль/л)
+        'C_H': ions_temp['H']['C'],
+        'C_SO4': ions_temp['SO4']['C'],
+        'C_Fe3': ions_temp['Fe3']['C'],
+        'C_Fe2': ions_temp['Fe2']['C'],
+        'C_K': ions_temp['K']['C'],
+        'C_NH4': ions_temp['NH4']['C'],
+        'C_Mg': ions_temp['Mg']['C'],
+        
+        # Активности
+        'a_H': ions_temp['H']['a'],
+        'a_SO4': ions_temp['SO4']['a'],
+        'a_HSO4': ions_temp['HSO4']['a'],
+        'a_Fe3': ions_temp['Fe3']['a'],
+        'a_Fe2': ions_temp['Fe2']['a'],
+        'a_K': ions_temp['K']['a'],
+        'a_NH4': ions_temp['NH4']['a'],
+        'a_Mg': ions_temp['Mg']['a'],
+        
+        # Константы равновесия
+        'K_HSO4': eq_constants['K_HSO4'],
+        'K_MgSO4': eq_constants['K_MgSO4'],
+        'final_I': eq_constants['I'],
+    }
+
+    return report
