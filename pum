@@ -178,7 +178,7 @@ class SpeciationSolver:
                 solution = x0
         
         SO4_new, H_new, HSO4_new = solution
-        
+        self.K_H2SO4 = K_HSO4
         return {
             "SO4": max(SO4_new, 1e-15),
             "H": max(H_new, 1e-15),
@@ -230,7 +230,8 @@ class SpeciationSolver:
                 solution = x0
         
         SO4_new, H_new, HSO4_new, Mg_new, MgSO4_new = solution
-        
+        self.K_MgSO4 = K_MgSO4
+        self.K_H2SO4 = K_HSO4
         return {
             "SO4": max(SO4_new, 1e-15),
             "H": max(H_new, 1e-15),
