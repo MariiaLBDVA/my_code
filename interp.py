@@ -1,0 +1,275 @@
+import pandas as pd
+import numpy as np
+from scipy.interpolate import interp1d
+from scipy.interpolate import RBFInterpolator
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
+
+def clean_experimental_data_local_outliers(X, y, z_thresh=3, k=15, method='zscore', 
+                                          return_mask=False, **kwargs):
+    """
+    Универсальная функция для очистки экспериментальных данных от выбросов.
+    
+    Parameters:
+    -----------
+    X : array-like, shape (n_samples, n_features)
+        Матрица признаков (например, температура, концентрация и т.д.)
+    y : array-like, shape (n_samples,)
+        Целевая переменная (например, растворимость)
+    z_thresh : float, default=3
+        Порог для z-оценки
+    k : int, default=15
+        Количество ближайших соседей
+    method : str, default='zscore'
+        Метод обнаружения выбросов: 'zscore', 'iqr', 'mad'
+    return_mask : bool, default=False
+        Возвращать ли маску вместо отфильтрованных данных
+    **kwargs : dict
+        Дополнительные параметры
+    
+    Returns:
+    --------
+    Если return_mask=False:
+        X_clean, y_clean : отфильтрованные данные
+    Если return_mask=True:
+        mask : булева маска (True для хороших точек)
+    """
+    X = np.asarray(X)
+    y = np.asarray(y)
+    
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    
+    mask_good = np.ones(len(y), dtype=bool)
+    
+    nbrs = NearestNeighbors(n_neighbors=min(k + 1, len(y)), **kwargs)
+    nbrs.fit(X)
+    distances, indices = nbrs.kneighbors(X)
+    
+    for i in range(len(y)):
+        neigh_idx = indices[i, 1:]  # исключаем саму точку
+        
+        # Локальная статистика
+        local_values = y[neigh_idx]
+        local_mean = np.mean(local_values)
+        local_std = np.std(local_values)
+        
+        # Разные методы обнаружения выбросов
+        if method == 'zscore':
+            if local_std > 0:
+                z_score = np.abs(y[i] - local_mean) / local_std
+                if z_score > z_thresh:
+                    mask_good[i] = False
+                    
+        elif method == 'iqr':
+            # Используем межквартильный размах
+            q1 = np.percentile(local_values, 25)
+            q3 = np.percentile(local_values, 75)
+            iqr = q3 - q1
+            if iqr > 0:
+                lower_bound = q1 - z_thresh * iqr
+                upper_bound = q3 + z_thresh * iqr
+                if y[i] < lower_bound or y[i] > upper_bound:
+                    mask_good[i] = False
+                    
+        else: 
+            method == 'mad'
+            # Медианное абсолютное отклонение
+            median = np.median(local_values)
+            mad = np.median(np.abs(local_values - median))
+            if mad > 0:
+                modified_z = 0.6745 * (y[i] - median) / mad
+                if np.abs(modified_z) > z_thresh:
+                    mask_good[i] = False
+
+    return mask_good
+
+
+class WaterPropertiesInterpolator:
+    def __init__(self):
+        self.table_temps_K = np.array([298.15, 328.15, 373.15, 513.15])
+        self.table_epsilon = np.array([88.3, 69.67, 55.4, 30.79])
+        self.table_density = np.array([0.72068, 0.65672, 0.55203, 0.27483])
+        
+        self.epsilon_interp = interp1d(
+            self.table_temps_K, self.table_epsilon,
+            kind='quadratic', fill_value='extrapolate' 
+        )
+        self.density_interp = interp1d(
+            self.table_temps_K, self.table_density,
+            kind='linear', fill_value='extrapolate'
+        )
+    
+    def get_density(self, T_K):
+        return float(self.density_interp(T_K))
+    
+    def get_dielectric(self, T_K):
+        return float(self.epsilon_interp(T_K))
+
+class Interpolator:
+    
+    def __init__(self, file_path, sheet_name):
+        self.df = pd.read_excel(file_path, sheet_name=sheet_name)
+        self.scaler = None
+        self.rbf_interpolator = None
+    
+    def prepare_data(self):
+        raise NotImplementedError
+
+class MgSO4ConstantInterpolator(Interpolator):
+    
+    def prepare_data(self):
+        temp = self.df.iloc[:, 0].values + 273.15
+        logK = self.df.iloc[:, 1].values
+        
+        data_df = pd.DataFrame({'temp': temp, 'logK': logK})
+        avg_df = data_df.groupby('temp', as_index=False).mean()
+        
+        self.temp = avg_df['temp'].values
+        self.logK = avg_df['logK'].values
+        
+        
+        self.interp_func = interp1d(
+            self.temp, self.logK,
+            kind='linear', fill_value=(self.logK[0], self.logK[-1]))
+    def get_K(self, T_K):
+        return (10 ** float(self.interp_func(T_K)))
+    
+class MgSO4SolubilityInterpolator(Interpolator):
+    
+    def prepare_data(self):
+        
+        temp_raw = self.df.iloc[:, 0].values
+        MgSO4_sol_raw = self.df.iloc[:, 2].values
+        H2SO4_conc_raw = self.df.iloc[:, 3].values
+
+        
+        mask = clean_experimental_data_local_outliers(
+            np.column_stack([temp_raw, H2SO4_conc_raw]), 
+            MgSO4_sol_raw,
+            return_mask=True,
+            z_thresh=10,
+            k=5
+        )
+        self.mask = mask
+        # Финальные очищенные данные
+        temp = temp_raw[mask]
+        MgSO4_sol = MgSO4_sol_raw[mask]
+        H2SO4_conc = H2SO4_conc_raw[mask]
+        
+        # Сохраняем данные для визуализации
+        #очищенные точки
+        self.points = np.column_stack([temp, H2SO4_conc])
+        self.MgSO4_sol = MgSO4_sol
+        #исходные точки
+        self.points_raw = np.column_stack([temp_raw, H2SO4_conc_raw])
+        self.MgSO4_sol_raw = MgSO4_sol_raw
+
+        self.scaler = StandardScaler()
+        self.points_normalized = self.scaler.fit_transform(self.points)
+        
+        self.rbf_interpolator = RBFInterpolator(
+            self.points_normalized, MgSO4_sol,
+            kernel='linear', smoothing=1
+        )
+
+    
+    def get_sol(self, T_K, H2SO4_conc):
+
+        # Определяем границы доступных значений
+        temp_min, H2SO4_conc_min = self.points.min(axis=0)
+        temp_max, H2SO4_conc_max = self.points.max(axis=0)
+        temp_safe = np.clip(T_K,temp_min, temp_max)
+        H2SO4_conc_safe = np.clip(H2SO4_conc,H2SO4_conc_min, H2SO4_conc_max)
+        point = np.array([[temp_safe, H2SO4_conc_safe]])
+        point_normalized = self.scaler.transform(point)
+        return float(self.rbf_interpolator(point_normalized)[0])
+    
+
+class H2SO4ConstantInterpolator3D(Interpolator):
+    
+    def prepare_data(self):
+        temp = self.df.iloc[:, 0].values + 273.15
+        logK = self.df.iloc[:, 1].values
+        ionic_strength = self.df.iloc[:, 2].values
+        
+        K = 10 ** logK
+        
+        self.points = np.column_stack([temp, ionic_strength])
+        
+        
+        
+        self.K = K
+        
+        self.scaler = StandardScaler()
+        self.points_normalized = self.scaler.fit_transform(self.points)
+        
+        self.rbf_interpolator = RBFInterpolator(
+            self.points_normalized, K,
+            kernel='cubic', smoothing=0.1
+        )
+    
+    def get_K(self, T_K, ionic_strength):
+        # Определяем границы доступных значений
+        temp_min, ionic_strength_min = self.points.min(axis=0)
+        temp_max, ionic_strength_max = self.points.max(axis=0)
+        temp_safe = np.clip(T_K,temp_min, temp_max)
+        ionic_strength_safe = np.clip(ionic_strength,ionic_strength_min, ionic_strength_max)
+        point = np.array([[temp_safe, ionic_strength_safe]])
+        point_normalized = self.scaler.transform(point)
+        return float(self.rbf_interpolator(point_normalized)[0])
+
+class FeIIIConstantInterpolator(Interpolator):
+    
+    def prepare_data(self):
+        temp = self.df.iloc[:, 0].values + 273.15
+        logK = self.df.iloc[:, 1].values
+        ionic_strength = self.df.iloc[:, 2].values
+        
+        K = 10 ** logK
+        
+        self.points = np.column_stack([temp, ionic_strength])
+        
+        
+        
+        self.K = K
+        
+        self.scaler = StandardScaler()
+        self.points_normalized = self.scaler.fit_transform(self.points)
+        
+        self.rbf_interpolator = RBFInterpolator(
+            self.points_normalized, K,
+            kernel='cubic', smoothing=0.1
+        )
+    
+    def get_K(self, T_K, ionic_strength):
+        # Определяем границы доступных значений
+        temp_min, ionic_strength_min = self.points.min(axis=0)
+        temp_max, ionic_strength_max = self.points.max(axis=0)
+        temp_safe = np.clip(T_K,temp_min, temp_max)
+        ionic_strength_safe = np.clip(ionic_strength,ionic_strength_min, ionic_strength_max)
+        point = np.array([[temp_safe, ionic_strength_safe]])
+        point_normalized = self.scaler.transform(point)
+        return float(self.rbf_interpolator(point_normalized)[0])
+
+class H2SO4ConstantInterpolator(Interpolator):
+    
+    def prepare_data(self):
+        temp = self.df.iloc[:, 0].values + 273.15
+        logK = self.df.iloc[:, 1].values
+        K = 10 ** logK
+        
+        data_df = pd.DataFrame({'temp': temp, 'K': K})
+        avg_df = data_df.groupby('temp', as_index=False).mean()
+        
+        self.temp = avg_df['temp'].values
+        self.K = avg_df['K'].values
+        
+        self.interp_func = interp1d(
+            self.temp, self.K,
+            kind='quadratic', fill_value='extrapolate'
+        )
+    
+    def get_K(self, T_K):
+    
+        return float(self.interp_func(T_K))
